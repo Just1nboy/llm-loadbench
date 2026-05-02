@@ -4,73 +4,62 @@
 [![PyTorch](https://img.shields.io/badge/pytorch-2.1%2B-EE4C2C)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> A reproducible CLI for benchmarking LLM loading strategies on consumer hardware.
+A small CLI for measuring how long different model loading strategies take, how much memory they use, and how fast they generate text afterwards.
 
-`llm-loadbench` runs five different model-loading strategies — **standard**, **mmap**, **lazy**, **streaming**, **cached** — against any HuggingFace causal LM, repeats each one with warmup + measured iterations, and emits a CSV of timing/memory metrics plus comparison charts and statistical significance tests.
+I built this for my thesis on memory-efficient LLM loading. The original code lived in a Jupyter notebook full of duplicated cells, and I wanted something I could actually run from the terminal and reuse across machines without copy-pasting things around.
 
-It exists because the question *"is mmap actually faster than `from_pretrained` on a 16 GB laptop?"* doesn't have a simple answer — it depends on disk, page cache state, model format (safetensors vs. bin), and how much RAM you've already given to your IDE. This tool measures it on the actual hardware you care about.
+## What it does
 
----
+You give it a HuggingFace model id and it runs five loading strategies against it: the default `from_pretrained`, memory-mapped loading via safetensors, lazy loading where weights only materialise on the first forward pass, weight streaming where each transformer block loads and frees during inference, and an in-memory state-dict cache. Each strategy runs for a configurable number of warmup and measured iterations, and the per-iteration metrics land in a CSV.
 
-## Background
+You then run `report` on that CSV and get a summary table, an efficiency comparison against the baseline, and three PNG charts.
 
-This tool was extracted from a thesis on memory-efficient LLM loading. The notebook prototype validated that meta-device init combined with PyTorch 2.1's `assign=True` flag for `load_state_dict` lets you swap weights into a model without paying the cost of random parameter initialization — which is what makes the `mmap` and `cached` strategies competitive with (or faster than) the default `from_pretrained` baseline.
+## Why bother
 
-If you're interested in the underlying technique, the relevant code is in [`llm_loadbench/metrics.py`](llm_loadbench/metrics.py) (`init_model_on_meta`, `load_and_tie`).
+The default load path in transformers is fine, but it does a couple of things you might not want. It allocates random parameters before overwriting them with real weights, which costs both time and a temporary memory spike. It also does not benefit much from the OS page cache on repeated loads of the same file, since the bytes get copied into a fresh tensor each time.
 
----
+Some of the strategies here sidestep that, by initialising on the meta device first and then using PyTorch 2.1's `assign=True` flag in `load_state_dict` to swap real tensors in without the random-init step. Whether that actually helps depends on your disk, your RAM, and how warm the page cache is, which is exactly why I wanted a benchmark instead of a guess.
 
 ## Strategies
 
-| Strategy    | What it does                                                                          | When it wins                                          |
-|-------------|---------------------------------------------------------------------------------------|-------------------------------------------------------|
-| `standard`  | Default `AutoModelForCausalLM.from_pretrained`. The baseline.                         | Reference point.                                      |
-| `mmap`      | Meta-device init + `safetensors` mmap (or `torch.load(mmap=True)`).                   | Repeated loads of the same model — OS page cache.     |
-| `lazy`      | Init with empty weights, materialize on first forward pass via pre-hook.              | When *load* time matters more than *first-token* time. |
-| `streaming` | Per-block weight loading via forward hooks; releases each block after it computes.    | Models too large to hold in RAM at once.              |
-| `cached`    | First call uses `from_pretrained`, then caches the state dict in memory for re-use.   | Benchmarks/serving with frequent reloads.             |
+| name | what it does |
+|------|--------------|
+| standard | Default `AutoModelForCausalLM.from_pretrained`, used as the baseline. |
+| mmap | Meta-device init, weights memory-mapped from safetensors or `torch.load(mmap=True)`. |
+| lazy | Init with empty weights, real weights load on the first forward pass via a pre-hook. |
+| streaming | Per-block weight loading via forward hooks, weights released after each block runs. |
+| cached | First call uses `from_pretrained` and caches the state dict, later calls re-hydrate from cache. |
 
-All strategies use the same `BaseLoader` interface (`load_model`, `generate`, `cleanup`) so adding a sixth is straightforward — drop a file in [`llm_loadbench/loaders/`](llm_loadbench/loaders/) and register it in [`runner.py`](llm_loadbench/runner.py).
-
----
+All five share the same `BaseLoader` interface, so adding a sixth is just a matter of dropping a file in `llm_loadbench/loaders/` and registering it in the runner.
 
 ## Install
 
-Requires **Python 3.10+** and **PyTorch 2.1+** (the `assign=True` flag on `load_state_dict` is mandatory — earlier versions don't have it).
+You need Python 3.10 or newer, and PyTorch 2.1 or newer, because `assign=True` did not exist before that.
 
-```bash
+```
 git clone https://github.com/Just1nboy/llm-loadbench.git
 cd llm-loadbench
 pip install -e .
 ```
 
-This registers `llm-loadbench` as a console script. CUDA is auto-detected; pass `--device cpu` to force CPU.
-
----
+That puts `llm-loadbench` on your PATH as a console command. CUDA is auto-detected, so you only need `--device cpu` if you want to force CPU.
 
 ## Quick start
 
-```bash
-# Inspect your hardware
+```
 llm-loadbench info
-
-# Smoke test (1 strategy, fast)
 llm-loadbench run --strategy mmap --iterations 2 --warmup 1
-
-# Full benchmark
 llm-loadbench run --strategy all --iterations 10 --warmup 3
-
-# Generate report from latest results
 llm-loadbench report --input results/latest.csv
 ```
 
----
+`info` is a hardware report, useful to record alongside your numbers so you can tell which machine produced them later. The two `run` examples are a quick smoke test and a full benchmark, in that order. `report` reads the latest CSV and writes the charts.
 
 ## Commands
 
-### `run` — execute the benchmark
+### run
 
-```bash
+```
 llm-loadbench run \
   --strategy all \
   --model EleutherAI/gpt-neo-125m \
@@ -80,66 +69,56 @@ llm-loadbench run \
   --max-new-tokens 50
 ```
 
-| Flag                | Default                                      | Meaning                                              |
-|---------------------|----------------------------------------------|------------------------------------------------------|
-| `--strategy`        | `all`                                        | Comma-separated list, or `all`. e.g. `mmap,cached`.  |
-| `--model`           | `EleutherAI/gpt-neo-125m`                    | Any HuggingFace causal LM repo ID.                   |
-| `--iterations`      | `10`                                         | Measured iterations per strategy.                    |
-| `--warmup`          | `3`                                          | Warmup iterations (discarded from results).          |
-| `--prompt`          | `"The future of artificial intelligence is"` | Prompt fed to `generate()`.                          |
-| `--max-new-tokens`  | `50`                                         | Tokens generated per iteration.                      |
-| `--output-dir`      | `results`                                    | CSV output directory.                                |
-| `--device`          | auto                                         | `cuda` or `cpu`. Auto-detected from `torch.cuda`.    |
+| flag | default | what it does |
+|------|---------|--------------|
+| `--strategy` | `all` | Comma-separated list of names, or `all`. |
+| `--model` | `EleutherAI/gpt-neo-125m` | Any HuggingFace causal LM repo id. |
+| `--iterations` | `10` | Measured iterations per strategy. |
+| `--warmup` | `3` | Warmup iterations, discarded from results. |
+| `--prompt` | `"The future of artificial intelligence is"` | Prompt fed to `generate`. |
+| `--max-new-tokens` | `50` | Tokens generated per iteration. |
+| `--output-dir` | `results` | Where the CSVs land. |
+| `--device` | auto | `cuda` or `cpu`, auto-detected if you leave it off. |
 
-Output:
-- `results/results_<model>_<YYYYMMDD_HHMMSS>.csv` — timestamped run.
-- `results/latest.csv` — copy of the most recent run, used by `report`.
+Each run produces two files, a timestamped CSV at `results_<model>_<YYYYMMDD_HHMMSS>.csv` and a copy at `latest.csv`, so the report command does not need to know the exact timestamp.
 
-### `report` — summarize a CSV
+### report
 
-```bash
+```
 llm-loadbench report --input results/latest.csv
 ```
 
-Prints a summary table (mean ± std per strategy) and an efficiency table (memory/load improvement vs. the `standard` baseline) to the terminal, then writes three PNGs alongside the CSV:
+Prints a summary table with mean and standard deviation per strategy, an efficiency table comparing each strategy against `standard`, and writes three PNGs next to the CSV. The PNGs are bar charts for the four metrics, an efficiency heatmap, and a line plot of load time across iterations, which is the one I look at when I want to see the page-cache warmup effect.
 
-- `comparison_<model>.png` — bar charts for load time, peak memory, TTFT, throughput.
-- `efficiency_<model>.png` — heatmap of memory and load-time improvement vs. baseline.
-- `iterations_<model>.png` — line plot of load time across iterations (catches caching/page-cache warmup effects).
+### info
 
-### `info` — hardware report
-
-```bash
+```
 llm-loadbench info
 ```
 
-Prints Python version, PyTorch version, OS, CPU, RAM, and GPU (if CUDA is available). Useful to record alongside results so you know what hardware produced them.
-
----
+Prints Python version, PyTorch version, OS, CPU, RAM, and GPU info if there is one. There are no flags, it is just a flat dump.
 
 ## CSV schema
 
-Each row in the output CSV is one measured iteration. Columns:
+One row per measured iteration. Columns:
 
-| Column               | Type   | Meaning                                                       |
-|----------------------|--------|---------------------------------------------------------------|
-| `strategy`           | str    | One of `standard`, `mmap`, `lazy`, `streaming`, `cached`.     |
-| `model_name`         | str    | HuggingFace repo ID.                                          |
-| `load_time_s`        | float  | Wall time of `loader.load_model()` in seconds.                |
-| `peak_memory_mb`     | float  | Process RSS peak during load + generate, in MB.               |
-| `ttft_s`             | float  | Time to first generated token, in seconds.                    |
-| `throughput_tps`     | float  | Tokens-per-second during the full generation.                 |
-| `total_inference_s`  | float  | Wall time for the full `max_new_tokens` generation.           |
-| `initial_memory_mb`  | float  | Process RSS just before this iteration started.               |
-| `memory_delta_mb`    | float  | `peak_memory_mb − initial_memory_mb`.                         |
+| column | type | meaning |
+|--------|------|---------|
+| strategy | str | One of the five strategy names. |
+| model_name | str | The HuggingFace repo id. |
+| load_time_s | float | Wall time spent inside `loader.load_model()`. |
+| peak_memory_mb | float | Process RSS peak during load and generate, in MB. |
+| ttft_s | float | Time to first generated token. |
+| throughput_tps | float | Tokens per second across the full generation. |
+| total_inference_s | float | Wall time for the full `max_new_tokens` generation. |
+| initial_memory_mb | float | Process RSS just before the iteration started. |
+| memory_delta_mb | float | `peak_memory_mb - initial_memory_mb`. |
 
-Mean ± std across iterations (and 95% CI for the summary table) are computed in [`analysis.py`](llm_loadbench/analysis.py) using `scipy.stats`.
-
----
+The summary table also reports 95% CIs computed with `scipy.stats`.
 
 ## Sample output
 
-From a `gpt-neo-125m` run on RTX 4060 Laptop GPU (16 GB RAM, Windows 11, 10 measured iterations):
+A run of standard and lazy on `gpt-neo-125m`, RTX 4060 Laptop, 16 GB RAM, 10 iterations:
 
 ```
 ======================================================================
@@ -157,9 +136,7 @@ gpt-neo-125m     lazy       1.49       28.07     1996.8        1.513
 gpt-neo-125m standard       0.00        0.00     2027.0        2.103
 ```
 
-The numbers above are partial (two strategies). What the table shows: `lazy` cuts load time by ~28% but pushes the cost into TTFT (1.12s vs. 0.02s), since real weight loading happens on the first forward pass. That's the kind of trade-off this benchmark surfaces.
-
----
+That is only two strategies, so it is not the full picture, it was just what the original notebook had finished running. The interesting thing in there is the trade-off lazy is making, it cuts load time by 28%, but pushes that cost into TTFT, from 0.02s up to 1.12s. Whether that is a win depends on whether you care about cold start or first-token latency.
 
 ## Project layout
 
@@ -167,13 +144,13 @@ The numbers above are partial (two strategies). What the table shows: `lazy` cut
 llm-loadbench/
 ├── llm_loadbench/
 │   ├── __init__.py
-│   ├── config.py          # ExperimentConfig dataclass
-│   ├── metrics.py         # BenchmarkMetrics, MetricsCollector, weight-loading helpers
-│   ├── runner.py          # BenchmarkRunner — orchestrates warmup/measured loops
-│   ├── analysis.py        # StatisticalAnalyzer + matplotlib charts
-│   ├── cli.py             # Click entrypoint (run / report / info)
+│   ├── config.py
+│   ├── metrics.py
+│   ├── runner.py
+│   ├── analysis.py
+│   ├── cli.py
 │   └── loaders/
-│       ├── base.py        # BaseLoader (shared generate())
+│       ├── base.py
 │       ├── standard.py
 │       ├── mmap.py
 │       ├── lazy.py
@@ -182,19 +159,19 @@ llm-loadbench/
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE
-└── results/               # Gitignored — CSV + PNG outputs land here.
+└── results/
 ```
 
----
+`results/` is gitignored, so a fresh clone will not bring along somebody else's CSVs.
 
 ## Hardware notes
 
-- The default model (`gpt-neo-125m`) is ~500 MB in fp32 and runs comfortably on 8 GB of RAM. Larger models (`gpt-neo-1.3B`, `gpt-neo-2.7B`) are listed in the original notebook but commented out — they need 16 GB+ to benchmark all five strategies in one session, since `cached` keeps a copy of the state dict resident.
-- Peak memory is measured via `psutil` process RSS, **not** CUDA memory — so for GPU runs the numbers reflect host-side allocations (state dicts, caches, mmap'd file pages), which is what most strategies are actually trying to optimize.
-- If you OOM on `--strategy all`, run subsets: `--strategy standard,mmap,streaming` keeps RAM low; `--strategy cached` last keeps its big resident copy isolated.
+The default `gpt-neo-125m` is roughly 500 MB in fp32 and runs comfortably on 8 GB of RAM. Larger ones like `gpt-neo-1.3B` are listed in the original notebook but commented out, because running all five strategies at once on a 16 GB machine gets tight, especially with `cached` keeping a full state-dict copy resident.
 
----
+Peak memory is measured via `psutil` process RSS, not CUDA memory, so for GPU runs the numbers are about host-side allocations like state dicts, caches, and mmap pages, which is what most of these strategies are trying to optimise in the first place.
+
+If you OOM on `--strategy all`, splitting it helps. Running `--strategy standard,mmap,streaming` first and `--strategy cached` separately keeps the heavy resident copy isolated.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

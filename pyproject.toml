@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-loadbench"
+version = "0.1.0"
+description = "CLI tool for benchmarking LLM loading strategies (standard, mmap, lazy, streaming, cached)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Justin Tirta" }]
+keywords = ["llm", "benchmark", "pytorch", "transformers", "inference", "loading"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.35",
+    "psutil>=5.9",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "scipy>=1.11",
+    "click>=8.1",
+    "tqdm>=4.65",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.19",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+llm-loadbench = "llm_loadbench.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Just1nboy/llm-loadbench"
+
+[tool.setuptools.packages.find]
+include = ["llm_loadbench*"]
